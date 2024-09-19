@@ -1,8 +1,10 @@
 import os
-import subprocess
 import time
 from dataclasses import dataclass
-from typing import List, cast
+from typing import List, Optional
+
+import asyncio
+from functools import lru_cache
 
 from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 import torch
@@ -15,6 +17,10 @@ from diffusers.pipelines.flux import (
 )
 
 from weights import WeightsDownloadCache
+
+import aiohttp
+import aiofiles
+import cv2
 
 MODEL_URL_DEV = (
     "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
@@ -38,109 +44,115 @@ ASPECT_RATIOS = {
     "9:21": (640, 1536),
 }
 
-
 @dataclass
 class LoadedLoRAs:
-    main: str | None
-    extra: str | None
-
+    main: Optional[str] = None
+    extra: Optional[str] = None
 
 class Predictor(BasePredictor):
     def setup(self) -> None:  # pyright: ignore
-        """Load the model into memory to make running multiple predictions efficient"""
+        """Initialize the weights cache and prepare for lazy loading of models."""
         start = time.time()
         # Don't pull weights
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
         self.weights_cache = WeightsDownloadCache()
 
-        print("Loading Flux dev pipeline")
-        if not FLUX_DEV_PATH.exists():
-            download_base_weights(MODEL_URL_DEV, Path("."))
-        dev_pipe = FluxPipeline.from_pretrained(
-            "FLUX.1-dev",
-            torch_dtype=torch.bfloat16,
-        ).to("cuda")
-
-        print("Loading Flux schnell pipeline")
-        if not FLUX_SCHNELL_PATH.exists():
-            download_base_weights(MODEL_URL_SCHNELL, FLUX_SCHNELL_PATH)
-        schnell_pipe = FluxPipeline.from_pretrained(
-            "FLUX.1-schnell",
-            vae=dev_pipe.vae,
-            text_encoder=dev_pipe.text_encoder,
-            text_encoder_2=dev_pipe.text_encoder_2,
-            tokenizer=dev_pipe.tokenizer,
-            tokenizer_2=dev_pipe.tokenizer_2,
-            torch_dtype=torch.bfloat16,
-        ).to("cuda")
-
-        self.pipes = {
-            "dev": dev_pipe,
-            "schnell": schnell_pipe,
-        }
-
-        # Load img2img pipelines
-        print("Loading Flux dev img2img pipeline")
-        dev_img2img_pipe = FluxImg2ImgPipeline(
-            transformer=dev_pipe.transformer,
-            scheduler=dev_pipe.scheduler,
-            vae=dev_pipe.vae,
-            text_encoder=dev_pipe.text_encoder,
-            text_encoder_2=dev_pipe.text_encoder_2,
-            tokenizer=dev_pipe.tokenizer,
-            tokenizer_2=dev_pipe.tokenizer_2,
-        ).to("cuda")
-
-        print("Loading Flux schnell img2img pipeline")
-        schnell_img2img_pipe = FluxImg2ImgPipeline(
-            transformer=schnell_pipe.transformer,
-            scheduler=schnell_pipe.scheduler,
-            vae=schnell_pipe.vae,
-            text_encoder=dev_pipe.text_encoder,
-            text_encoder_2=dev_pipe.text_encoder_2,
-            tokenizer=dev_pipe.tokenizer,
-            tokenizer_2=dev_pipe.tokenizer_2,
-        ).to("cuda")
-
-        self.img2img_pipes = {
-            "dev": dev_img2img_pipe,
-            "schnell": schnell_img2img_pipe,
-        }
-
-        # Load inpainting pipelines
-        print("Loading Flux dev inpaint pipeline")
-        dev_inpaint_pipe = FluxInpaintPipeline(
-            transformer=dev_pipe.transformer,
-            scheduler=dev_pipe.scheduler,
-            vae=dev_pipe.vae,
-            text_encoder=dev_pipe.text_encoder,
-            text_encoder_2=dev_pipe.text_encoder_2,
-            tokenizer=dev_pipe.tokenizer,
-            tokenizer_2=dev_pipe.tokenizer_2,
-        ).to("cuda")
-
-        print("Loading Flux schnell inpaint pipeline")
-        schnell_inpaint_pipe = FluxInpaintPipeline(
-            transformer=schnell_pipe.transformer,
-            scheduler=schnell_pipe.scheduler,
-            vae=schnell_pipe.vae,
-            text_encoder=dev_pipe.text_encoder,
-            text_encoder_2=dev_pipe.text_encoder_2,
-            tokenizer=dev_pipe.tokenizer,
-            tokenizer_2=dev_pipe.tokenizer_2,
-        ).to("cuda")
-
-        self.inpaint_pipes = {
-            "dev": dev_inpaint_pipe,
-            "schnell": schnell_inpaint_pipe,
-        }
+        # Initialize dictionaries for lazy loading
+        self.pipes = {}
+        self.img2img_pipes = {}
+        self.inpaint_pipes = {}
 
         self.loaded_lora_urls = {
-            "dev": LoadedLoRAs(main=None, extra=None),
-            "schnell": LoadedLoRAs(main=None, extra=None),
+            "dev": LoadedLoRAs(),
+            "schnell": LoadedLoRAs(),
         }
-        print("setup took: ", time.time() - start)
+        print("Setup initiated")
+        print("Setup took:", time.time() - start)
+
+    async def async_load_model(self, session, url: str, path: Path, model_name: str) -> FluxPipeline:
+        """Asynchronously download and load a single model."""
+        if not path.exists():
+            await self.download_base_weights(session, url, path)
+        pipe = FluxPipeline.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+        ).to("cuda")
+        return pipe
+
+    async def download_and_load_pipes(self, model_key: str, url: str, path: Path, model_name: str):
+        """Download and load pipelines for a specific model."""
+        async with aiohttp.ClientSession() as session:
+            pipe = await self.async_load_model(session, url, path, model_name)
+            self.pipes[model_key] = pipe
+
+            # Load img2img pipeline
+            img2img_pipe = FluxImg2ImgPipeline(
+                transformer=pipe.transformer,
+                scheduler=pipe.scheduler,
+                vae=pipe.vae,
+                text_encoder=pipe.text_encoder,
+                text_encoder_2=pipe.text_encoder_2,
+                tokenizer=pipe.tokenizer,
+                tokenizer_2=pipe.tokenizer_2,
+            ).to("cuda")
+            self.img2img_pipes[model_key] = img2img_pipe
+
+            # Load inpaint pipeline
+            inpaint_pipe = FluxInpaintPipeline(
+                transformer=pipe.transformer,
+                scheduler=pipe.scheduler,
+                vae=pipe.vae,
+                text_encoder=pipe.text_encoder,
+                text_encoder_2=pipe.text_encoder_2,
+                tokenizer=pipe.tokenizer,
+                tokenizer_2=pipe.tokenizer_2,
+            ).to("cuda")
+            self.inpaint_pipes[model_key] = inpaint_pipe
+
+            print(f"Loaded {model_key} pipelines")
+
+    async def download_base_weights(self, session, url: str, dest: Path):
+        """Asynchronously download model weights using aiohttp."""
+        start = time.time()
+        print("Downloading URL:", url)
+        print("Downloading to:", dest)
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            # Ensure the destination directory exists
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            f = await aiofiles.open(dest, mode='wb')
+            async for chunk in resp.content.iter_chunked(1024):
+                await f.write(chunk)
+            await f.close()
+        print("Download completed in:", time.time() - start)
+
+    async def async_setup_pipes(self):
+        """Asynchronously prepare any necessary resources for lazy loading."""
+        # No models are loaded during setup; models are loaded on demand
+        pass
+
+    def setup_async(self):
+        """Synchronous wrapper for asynchronous setup."""
+        asyncio.run(self.async_setup_pipes())
+
+    async def ensure_model_loaded(self, model: str):
+        """Ensure that the requested model is loaded, loading it if necessary."""
+        if model in self.pipes:
+            print(f"Model '{model}' is already loaded.")
+            return
+
+        models_info = {
+            "dev": (MODEL_URL_DEV, FLUX_DEV_PATH, "FLUX.1-dev"),
+            "schnell": (MODEL_URL_SCHNELL, FLUX_SCHNELL_PATH, "FLUX.1-schnell"),
+        }
+
+        if model not in models_info:
+            raise ValueError(f"Unknown model: {model}")
+
+        url, path, model_name = models_info[model]
+        print(f"Loading model '{model}'...")
+        await self.download_and_load_pipes(model, url, path, model_name)
 
     @torch.inference_mode()
     def predict(  # pyright: ignore
@@ -238,6 +250,9 @@ class Predictor(BasePredictor):
         ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
+        # Ensure the required model is loaded
+        asyncio.run(self.ensure_model_loaded(model))
+
         if seed is None or seed < 0:
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
@@ -260,8 +275,12 @@ class Predictor(BasePredictor):
         print(f"Prompt: {prompt}")
 
         if is_img2img_mode or is_inpaint_mode:
-            input_image = Image.open(image).convert("RGB")
-            original_width, original_height = input_image.size
+            # Use OpenCV for faster image processing
+            input_image = cv2.imread(str(image))
+            if input_image is None:
+                raise ValueError(f"Cannot open image: {image}")
+            input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
+            original_height, original_width = input_image.shape[:2]
 
             # Calculate dimensions that are multiples of 16
             target_width = make_multiple_of_16(original_width)
@@ -275,21 +294,29 @@ class Predictor(BasePredictor):
             # Determine if we should use highest quality settings
             use_highest_quality = output_quality == 100 or output_format == "png"
 
-            # Resize the input image
-            resampling_method = Image.Resampling.LANCZOS if use_highest_quality else Image.Resampling.BICUBIC
-            input_image = input_image.resize(target_size, resampling_method)
+            # Resize the input image using OpenCV
+            resampling_method = cv2.INTER_LANCZOS4 if use_highest_quality else cv2.INTER_CUBIC
+            input_image = cv2.resize(input_image, target_size, interpolation=resampling_method)
+            input_image = Image.fromarray(input_image)  # Convert back to PIL for compatibility
             flux_kwargs["image"] = input_image
 
             # Set width and height to match the resized input image
             flux_kwargs["width"], flux_kwargs["height"] = target_size
+
+            if model not in self.pipes:
+                raise ValueError(f"Model '{model}' is not loaded.")
 
             if is_img2img_mode:
                 print("[!] img2img mode")
                 pipe = self.img2img_pipes[model]
             else:  # is_inpaint_mode
                 print("[!] inpaint mode")
-                mask_image = Image.open(mask).convert("RGB")
-                mask_image = mask_image.resize(target_size, Image.Resampling.NEAREST)
+                # Process mask image with OpenCV
+                mask_image = cv2.imread(str(mask), cv2.IMREAD_GRAYSCALE)
+                if mask_image is None:
+                    raise ValueError(f"Cannot open mask image: {mask}")
+                mask_image = cv2.resize(mask_image, target_size, interpolation=cv2.INTER_NEAREST)
+                mask_image = Image.fromarray(mask_image).convert("RGB")
                 flux_kwargs["mask_image"] = mask_image
                 pipe = self.inpaint_pipes[model]
 
@@ -299,6 +326,8 @@ class Predictor(BasePredictor):
             )
         else:  # is_txt2img_mode
             print("[!] txt2img mode")
+            if model not in self.pipes:
+                raise ValueError(f"Model '{model}' is not loaded.")
             pipe = self.pipes[model]
             flux_kwargs["width"] = width
             flux_kwargs["height"] = height
@@ -344,15 +373,16 @@ class Predictor(BasePredictor):
             "output_type": "pil",
         }
 
+        # Batch inference
         output = pipe(**common_args, **flux_kwargs)
 
         output_paths = []
         for i, image in enumerate(output.images):
-            output_path = f"/tmp/out-{i}.{output_format}"
+            output_path = f"./out-{i}.{output_format}"
             if output_format != "png":
-                image.save(output_path, quality=output_quality, optimize=True) # type: ignore
+                image.save(output_path, quality=output_quality, optimize=True)  # type: ignore
             else:
-                image.save(output_path) # type: ignore
+                image.save(output_path)  # type: ignore
             output_paths.append(Path(output_path))
 
         if len(output_paths) == 0:
@@ -360,6 +390,7 @@ class Predictor(BasePredictor):
                 "No output generated. Try running it again, or try a different prompt."
             )
 
+        print(f"Generated {len(output_paths)} image(s).")
         return output_paths
 
     def load_single_lora(self, lora_url: str, model: str):
@@ -381,17 +412,19 @@ class Predictor(BasePredictor):
         # If no change, skip
         if (
             main_lora_url == loaded_lora_urls.main
-            and extra_lora_url == self.loaded_lora_urls[model].extra
+            and extra_lora_url == loaded_lora_urls.extra
         ):
             print("Weights already loaded")
             return
 
-        # We always need to load both?
+        # Unload existing LoRA weights
         pipe.unload_lora_weights()
 
+        # Load main LoRA
         main_lora_path = self.weights_cache.ensure(main_lora_url)
         pipe.load_lora_weights(main_lora_path, adapter_name="main")
 
+        # Load extra LoRA
         extra_lora_path = self.weights_cache.ensure(extra_lora_url)
         pipe.load_lora_weights(extra_lora_path, adapter_name="extra")
 
@@ -399,18 +432,80 @@ class Predictor(BasePredictor):
             main=main_lora_url, extra=extra_lora_url
         )
 
+    @lru_cache(maxsize=None)  # Cached to avoid repeated calculations
     def aspect_ratio_to_width_height(self, aspect_ratio: str) -> tuple[int, int]:
         return ASPECT_RATIOS[aspect_ratio]
-
-
-def download_base_weights(url: str, dest: Path):
-    start = time.time()
-    print("downloading url: ", url)
-    print("downloading to: ", dest)
-    subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
-    print("downloading took: ", time.time() - start)
-
 
 def make_multiple_of_16(n):
     # Rounds up to the next multiple of 16, or returns n if already a multiple of 16
     return ((n + 15) // 16) * 16
+
+# --------------------------- Testing Harness Below ---------------------------
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path as SysPath  # To avoid confusion with cog.Path
+
+    def parse_args():
+        parser = argparse.ArgumentParser(description="Test Predictor Class")
+        parser.add_argument("--prompt", type=str, required=True, help="Prompt for image generation.")
+        parser.add_argument("--image", type=str, default=None, help="Path to input image for img2img or inpainting.")
+        parser.add_argument("--mask", type=str, default=None, help="Path to mask image for inpainting.")
+        parser.add_argument("--aspect_ratio", type=str, default="1:1", choices=list(ASPECT_RATIOS.keys()) + ["custom"], help="Aspect ratio for txt2img mode.")
+        parser.add_argument("--width", type=int, default=None, help="Width for custom aspect ratio.")
+        parser.add_argument("--height", type=int, default=None, help="Height for custom aspect ratio.")
+        parser.add_argument("--num_outputs", type=int, default=1, choices=range(1,5), help="Number of images to generate.")
+        parser.add_argument("--lora_scale", type=float, default=1.0, help="Scale for main LoRA.")
+        parser.add_argument("--num_inference_steps", type=int, default=28, help="Number of inference steps.")
+        parser.add_argument("--model", type=str, default="dev", choices=["dev", "schnell"], help="Model to use.")
+        parser.add_argument("--guidance_scale", type=float, default=3.5, help="Guidance scale for diffusion.")
+        parser.add_argument("--prompt_strength", type=float, default=0.8, help="Prompt strength for img2img/inpaint.")
+        parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
+        parser.add_argument("--extra_lora", type=str, default=None, help="Extra LoRA URL.")
+        parser.add_argument("--extra_lora_scale", type=float, default=1.0, help="Scale for extra LoRA.")
+        parser.add_argument("--output_format", type=str, default="webp", choices=["webp", "jpg", "png"], help="Format of output images.")
+        parser.add_argument("--output_quality", type=int, default=90, help="Quality of output images (0-100).")
+        parser.add_argument("--replicate_weights", type=str, default=None, help="Replicate LoRA weights URL.")
+        return parser.parse_args()
+
+    async def run_prediction(predictor, args):
+        """Asynchronously run the prediction."""
+        # Convert SysPath to cog.Path if necessary
+        image_path = Path(args.image) if args.image else None
+        mask_path = Path(args.mask) if args.mask else None
+
+        output_paths = predictor.predict(
+            prompt=args.prompt,
+            image=image_path,
+            mask=mask_path,
+            aspect_ratio=args.aspect_ratio,
+            width=args.width,
+            height=args.height,
+            num_outputs=args.num_outputs,
+            lora_scale=args.lora_scale,
+            num_inference_steps=args.num_inference_steps,
+            model=args.model,
+            guidance_scale=args.guidance_scale,
+            prompt_strength=args.prompt_strength,
+            seed=args.seed,
+            extra_lora=args.extra_lora,
+            extra_lora_scale=args.extra_lora_scale,
+            output_format=args.output_format,
+            output_quality=args.output_quality,
+            replicate_weights=args.replicate_weights,
+        )
+
+        print("Generated Images:")
+        for path in output_paths:
+            print(path)
+
+    def main():
+        args = parse_args()
+        predictor = Predictor()
+        print("Running setup...")
+        predictor.setup_async()
+
+        print("Running prediction...")
+        asyncio.run(run_prediction(predictor, args))
+
+    main()
