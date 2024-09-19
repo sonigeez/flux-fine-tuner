@@ -26,7 +26,6 @@ from huggingface_hub import HfApi
 from jobs import BaseJob
 from toolkit.config import get_config
 
-from caption import Captioner
 from wandb_client import WeightsAndBiasesClient, logout_wandb
 from layer_match import match_layers_to_optimize, available_layers_to_optimize
 
@@ -85,11 +84,10 @@ class CustomJob(BaseJob):
         self.process_dict = {"custom_sd_trainer": CustomSDTrainer}
         self.load_processes(self.process_dict)
         for process in self.process:
-            process.wandb = wandb_client
+            process.wandb = wandb_client # type: ignore
 
     def run(self):
         super().run()
-        # Keeping this for backwards compatibility
         print(
             f"Running  {len(self.process)} process{'' if len(self.process) == 1 else 'es'}"
         )
@@ -103,23 +101,12 @@ class TrainingOutput(BaseModel):
 
 def train(
     input_images: Path = Input(
-        description="A zip file containing the images that will be used for training. We recommend a minimum of 10 images. If you include captions, include them as one .txt file per image, e.g. my-photo.jpg should have a caption file named my-photo.txt. If you don't include captions, you can use autocaptioning (enabled by default).",
+        description="A zip file containing the images that will be used for training. We recommend a minimum of 10 images. If you include captions, include them as one .txt file per image, e.g. my-photo.jpg should have a caption file named my-photo.txt. If you don't include captions, captions are optional.",
         default=None,
     ),
     trigger_word: str = Input(
-        description="The trigger word refers to the object, style or concept you are training on. Pick a string that isn’t a real word, like TOK or something related to what’s being trained, like CYBRPNK. The trigger word you specify here will be associated with all images during training. Then when you use your LoRA, you can include the trigger word in prompts to help activate the LoRA.",
+        description="The trigger word refers to the object, style or concept you are training on. Pick a string that isn’t a real word, like TOK or something related to what’s being trained, like CYBRPNK.",
         default="TOK",
-    ),
-    autocaption: bool = Input(
-        description="Automatically caption images using Llava v1.5 13B", default=True
-    ),
-    autocaption_prefix: str = Input(
-        description="Optional: Text you want to appear at the beginning of all your generated captions; for example, ‘a photo of TOK, ’. You can include your trigger word in the prefix. Prefixes help set the right context for your captions, and the captioner will use this prefix as context.",
-        default=None,
-    ),
-    autocaption_suffix: str = Input(
-        description="Optional: Text you want to appear at the end of all your generated captions; for example, ‘ in the style of TOK’. You can include your trigger word in suffixes. Suffixes help set the right concept for your captions, and the captioner will use this suffix as context.",
-        default=None,
     ),
     steps: int = Input(
         description="Number of training steps. Recommended range 500-4000",
@@ -138,13 +125,13 @@ def train(
         description="Image resolutions for training", default="512,768,1024"
     ),
     lora_rank: int = Input(
-        description="Higher ranks take longer to train but can capture more complex features. Caption quality is more important for higher ranks.",
+        description="Higher ranks take longer to train but can capture more complex features.",
         default=16,
         ge=1,
         le=128,
     ),
     caption_dropout_rate: float = Input(
-        description="Advanced setting. Determines how often a caption is ignored. 0.05 means for 5% of all steps an image will be used without its caption. 0 means always use captions, while 1 means never use them. Dropping captions helps capture more details of an image, and can prevent over-fitting words with specific image elements. Try higher values when training a style.",
+        description="Advanced setting. Determines how often a caption is ignored. 0.05 means for 5% of all steps an image will be used without its caption.",
         default=0.05,
         ge=0,
         le=1,
@@ -158,11 +145,11 @@ def train(
         default=False,
     ),
     layers_to_optimize_regex: str = Input(
-        description="Regular expression to match specific layers to optimize. Optimizing fewer layers results in shorter training times, but can also result in a weaker LoRA. For example, To target layers 7, 12, 16, 20 which seems to create good likeness with faster training (as discovered by lux in the Ostris discord, inspired by The Last Ben), use `transformer.single_transformer_blocks.(7|12|16|20).proj_out`.",
+        description="Regular expression to match specific layers to optimize.",
         default=None,
     ),
     hf_repo_id: str = Input(
-        description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face. For example, lucataco/flux-dev-lora. If the given repo does not exist, a new public repo will be created.",
+        description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face.",
         default=None,
     ),
     hf_token: Secret = Input(
@@ -186,32 +173,24 @@ def train(
         default=None,
     ),
     wandb_sample_interval: int = Input(
-        description="Step interval for sampling output images that are logged to W&B. Only applicable if wandb_api_key is set.",
+        description="Step interval for sampling output images that are logged to W&B.",
         default=100,
         ge=1,
     ),
     wandb_sample_prompts: str = Input(
-        description="Newline-separated list of prompts to use when logging samples to W&B. Only applicable if wandb_api_key is set.",
+        description="Newline-separated list of prompts to use when logging samples to W&B.",
         default=None,
     ),
     wandb_save_interval: int = Input(
-        description="Step interval for saving intermediate LoRA weights to W&B. Only applicable if wandb_api_key is set.",
+        description="Step interval for saving intermediate LoRA weights to W&B.",
         default=100,
         ge=1,
     ),
-    skip_training_and_use_pretrained_hf_lora_url: str = Input(
-        description="If you’d like to skip LoRA training altogether and instead create a Replicate model from a pre-trained LoRA that’s on HuggingFace, use this field with a HuggingFace download URL. For example, https://huggingface.co/fofr/flux-80s-cyberpunk/resolve/main/lora.safetensors.",
-        default=None,
-    ),
+    
 ) -> TrainingOutput:
     clean_up()
     output_path = "/tmp/trained_model.tar"
 
-    if skip_training_and_use_pretrained_hf_lora_url is not None:
-        download_huggingface_lora(
-            skip_training_and_use_pretrained_hf_lora_url, output_path
-        )
-        return TrainingOutput(weights=Path(output_path))
     if not input_images:
         raise ValueError("input_images must be provided")
 
@@ -257,7 +236,6 @@ def train(
                                 "caption_ext": "txt",
                                 "caption_dropout_rate": caption_dropout_rate,
                                 "shuffle_tokens": False,
-                                # TODO: Do we need to cache to disk? It's faster not to.
                                 "cache_latents_to_disk": cache_latents_to_disk,
                                 "cache_latents": True,
                                 "resolution": [
@@ -308,17 +286,19 @@ def train(
     )
 
     if layers_to_optimize:
-        train_config["config"]["process"][0]["network"]["network_kwargs"] = {
-            "only_if_contains": layers_to_optimize
-        }
+       if "config" in train_config and isinstance(train_config["config"], dict):
+            if "process" in train_config["config"] and isinstance(train_config["config"]["process"], list):
+                if len(train_config["config"]["process"]) > 0 and isinstance(train_config["config"]["process"][0], dict):
+                    if "network" in train_config["config"]["process"][0] and isinstance(train_config["config"]["process"][0]["network"], dict):
+                        train_config["config"]["process"][0]["network"]["network_kwargs"] = {
+                            "only_if_contains": layers_to_optimize
+                        }
+
 
     wandb_client = None
     if wandb_api_key:
         wandb_config = {
             "trigger_word": trigger_word,
-            "autocaption": autocaption,
-            "autocaption_prefix": autocaption_prefix,
-            "autocaption_suffix": autocaption_suffix,
             "steps": steps,
             "learning_rate": learning_rate,
             "batch_size": batch_size,
@@ -340,14 +320,16 @@ def train(
     extract_zip(input_images, INPUT_DIR)
 
     if not trigger_word:
-        del train_config["config"]["process"][0]["trigger_word"]
+        if isinstance(train_config, dict):
+            config = train_config.get("config", {})
+            if isinstance(config, dict):
+                process = config.get("process", [])
+                if isinstance(process, list) and process and isinstance(process[0], dict):
+                    process[0].pop("trigger_word", None)
+        elif isinstance(train_config, str):
+            print("Warning: train_config is a string, cannot remove trigger_word")
 
-    captioner = Captioner()
-    if autocaption and not captioner.all_images_are_captioned(INPUT_DIR):
-        captioner.load_models()
-        captioner.caption_images(INPUT_DIR, autocaption_prefix, autocaption_suffix)
 
-    del captioner
     torch.cuda.empty_cache()
 
     print("Starting train job")
@@ -377,19 +359,9 @@ def train(
     if optimizer_file.exists():
         optimizer_file.unlink()
 
-    # Copy generated captions to the output tar
-    # But do not upload publicly to HF
-    captions_dir = JOB_DIR / "captions"
-    captions_dir.mkdir(exist_ok=True)
-    for caption_file in INPUT_DIR.glob("*.txt"):
-        shutil.copy(caption_file, captions_dir)
-
     os.system(f"tar -cvf {output_path} {JOB_DIR}")
 
     if hf_token is not None and hf_repo_id is not None:
-        if captions_dir.exists():
-            shutil.rmtree(captions_dir)
-
         try:
             handle_hf_readme(hf_repo_id, trigger_word)
             print(f"Uploading to Hugging Face: {hf_repo_id}")
@@ -406,9 +378,9 @@ def train(
 
             api.upload_folder(
                 repo_id=hf_repo_id,
-                folder_path=JOB_DIR,
-                repo_type="model",
-                use_auth_token=hf_token.get_secret_value(),
+                folder_path=str(JOB_DIR),
+                commit_message="Upload model files",
+                token=hf_token.get_secret_value(),
             )
         except Exception as e:
             print(f"Error uploading to Hugging Face: {str(e)}")

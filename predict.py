@@ -4,23 +4,14 @@ import time
 from dataclasses import dataclass
 from typing import List, cast
 
-import numpy as np
+from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 import torch
-import logging
 from PIL import Image
 from cog import BasePredictor, Input, Path
 from diffusers.pipelines.flux import (
     FluxPipeline,
     FluxInpaintPipeline,
     FluxImg2ImgPipeline,
-)
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker,
-)
-from transformers import (
-    CLIPImageProcessor,
-    AutoModelForImageClassification,
-    ViTImageProcessor,
 )
 
 from weights import WeightsDownloadCache
@@ -29,17 +20,9 @@ MODEL_URL_DEV = (
     "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
 )
 MODEL_URL_SCHNELL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/slim.tar"
-SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
-SAFETY_CACHE_PATH = Path("safety-cache")
 FLUX_DEV_PATH = Path("FLUX.1-dev")
 FLUX_SCHNELL_PATH = Path("FLUX.1-schnell")
 FEATURE_EXTRACTOR = Path("/src/feature-extractor")
-
-FALCON_MODEL_NAME = "Falconsai/nsfw_image_detection"
-FALCON_MODEL_CACHE = "falcon-cache"
-FALCON_MODEL_URL = (
-    "https://weights.replicate.delivery/default/falconai/nsfw-image-detection.tar"
-)
 
 ASPECT_RATIOS = {
     "1:1": (1024, 1024),
@@ -54,10 +37,6 @@ ASPECT_RATIOS = {
     "9:16": (768, 1344),
     "9:21": (640, 1536),
 }
-
-# Suppress diffusers nsfw warnings
-logging.getLogger("diffusers").setLevel(logging.CRITICAL)
-logging.getLogger("transformers").setLevel(logging.CRITICAL)
 
 
 @dataclass
@@ -74,25 +53,6 @@ class Predictor(BasePredictor):
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
         self.weights_cache = WeightsDownloadCache()
-
-        print("Loading safety checker...")
-        if not SAFETY_CACHE_PATH.exists():
-            download_base_weights(SAFETY_URL, SAFETY_CACHE_PATH)
-        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_CACHE_PATH, torch_dtype=torch.float16
-        ).to("cuda")  # pyright: ignore
-        self.feature_extractor = cast(
-            CLIPImageProcessor, CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
-        )
-
-        print("Loading Falcon safety checker...")
-        if not Path(FALCON_MODEL_CACHE).exists():
-            download_base_weights(FALCON_MODEL_URL, FALCON_MODEL_CACHE)
-        self.falcon_model = AutoModelForImageClassification.from_pretrained(
-            FALCON_MODEL_NAME,
-            cache_dir=FALCON_MODEL_CACHE,
-        )
-        self.falcon_processor = ViTImageProcessor.from_pretrained(FALCON_MODEL_NAME)
 
         print("Loading Flux dev pipeline")
         if not FLUX_DEV_PATH.exists():
@@ -137,10 +97,10 @@ class Predictor(BasePredictor):
             transformer=schnell_pipe.transformer,
             scheduler=schnell_pipe.scheduler,
             vae=schnell_pipe.vae,
-            text_encoder=schnell_pipe.text_encoder,
-            text_encoder_2=schnell_pipe.text_encoder_2,
-            tokenizer=schnell_pipe.tokenizer,
-            tokenizer_2=schnell_pipe.tokenizer_2,
+            text_encoder=dev_pipe.text_encoder,
+            text_encoder_2=dev_pipe.text_encoder_2,
+            tokenizer=dev_pipe.tokenizer,
+            tokenizer_2=dev_pipe.tokenizer_2,
         ).to("cuda")
 
         self.img2img_pipes = {
@@ -165,10 +125,10 @@ class Predictor(BasePredictor):
             transformer=schnell_pipe.transformer,
             scheduler=schnell_pipe.scheduler,
             vae=schnell_pipe.vae,
-            text_encoder=schnell_pipe.text_encoder,
-            text_encoder_2=schnell_pipe.text_encoder_2,
-            tokenizer=schnell_pipe.tokenizer,
-            tokenizer_2=schnell_pipe.tokenizer_2,
+            text_encoder=dev_pipe.text_encoder,
+            text_encoder_2=dev_pipe.text_encoder_2,
+            tokenizer=dev_pipe.tokenizer,
+            tokenizer_2=dev_pipe.tokenizer_2,
         ).to("cuda")
 
         self.inpaint_pipes = {
@@ -276,10 +236,6 @@ class Predictor(BasePredictor):
             description="Replicate LoRA weights to use. Leave blank to use the default weights.",
             default=None,
         ),
-        disable_safety_checker: bool = Input(
-            description="Disable safety checker for generated images.",
-            default=False,
-        ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         if seed is None or seed < 0:
@@ -320,7 +276,7 @@ class Predictor(BasePredictor):
             use_highest_quality = output_quality == 100 or output_format == "png"
 
             # Resize the input image
-            resampling_method = Image.LANCZOS if use_highest_quality else Image.BICUBIC
+            resampling_method = Image.Resampling.LANCZOS if use_highest_quality else Image.Resampling.BICUBIC
             input_image = input_image.resize(target_size, resampling_method)
             flux_kwargs["image"] = input_image
 
@@ -333,7 +289,7 @@ class Predictor(BasePredictor):
             else:  # is_inpaint_mode
                 print("[!] inpaint mode")
                 mask_image = Image.open(mask).convert("RGB")
-                mask_image = mask_image.resize(target_size, Image.NEAREST)
+                mask_image = mask_image.resize(target_size, Image.Resampling.NEAREST)
                 flux_kwargs["mask_image"] = mask_image
                 pipe = self.inpaint_pipes[model]
 
@@ -390,31 +346,18 @@ class Predictor(BasePredictor):
 
         output = pipe(**common_args, **flux_kwargs)
 
-        has_nsfw_content = None
-        if not disable_safety_checker:
-            _, has_nsfw_content = self.run_safety_checker(output.images)
-
         output_paths = []
         for i, image in enumerate(output.images):
-            if has_nsfw_content is not None and has_nsfw_content[i]:
-                try:
-                    falcon_is_safe = self.run_falcon_safety_checker(image)
-                except Exception as e:
-                    print(f"Error running safety checker: {e}")
-                    falcon_is_safe = False
-                if not falcon_is_safe:
-                    print(f"NSFW content detected in image {i}")
-                    continue
             output_path = f"/tmp/out-{i}.{output_format}"
             if output_format != "png":
-                image.save(output_path, quality=output_quality, optimize=True)
+                image.save(output_path, quality=output_quality, optimize=True) # type: ignore
             else:
-                image.save(output_path)
+                image.save(output_path) # type: ignore
             output_paths.append(Path(output_path))
 
         if len(output_paths) == 0:
             raise Exception(
-                "NSFW content detected. Try running it again, or try a different prompt."
+                "No output generated. Try running it again, or try a different prompt."
             )
 
         return output_paths
@@ -455,29 +398,6 @@ class Predictor(BasePredictor):
         self.loaded_lora_urls[model] = LoadedLoRAs(
             main=main_lora_url, extra=extra_lora_url
         )
-
-    @torch.amp.autocast("cuda")  # pyright: ignore
-    def run_safety_checker(self, image):
-        safety_checker_input = self.feature_extractor(image, return_tensors="pt").to(
-            "cuda"
-        )
-        np_image = [np.array(val) for val in image]
-        image, has_nsfw_concept = self.safety_checker(
-            images=np_image,
-            clip_input=safety_checker_input.pixel_values.to(torch.float16),
-        )
-        return image, has_nsfw_concept
-
-    @torch.amp.autocast("cuda")  # pyright: ignore
-    def run_falcon_safety_checker(self, image):
-        with torch.no_grad():
-            inputs = self.falcon_processor(images=image, return_tensors="pt")
-            outputs = self.falcon_model(**inputs)
-            logits = outputs.logits
-            predicted_label = logits.argmax(-1).item()
-            result = self.falcon_model.config.id2label[predicted_label]
-
-        return result == "normal"
 
     def aspect_ratio_to_width_height(self, aspect_ratio: str) -> tuple[int, int]:
         return ASPECT_RATIOS[aspect_ratio]
