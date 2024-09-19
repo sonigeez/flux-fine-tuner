@@ -2,13 +2,17 @@ import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional
-
-import asyncio
-from functools import lru_cache
-
-from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+import requests
 import torch
 from PIL import Image
+from dotenv import load_dotenv
+load_dotenv()
+import cv2
+
+from huggingface_hub import login
+print(os.getenv("HF_TOKEN"))
+login(token=os.getenv("HF_TOKEN"))
+
 from cog import BasePredictor, Input, Path
 from diffusers.pipelines.flux import (
     FluxPipeline,
@@ -18,16 +22,6 @@ from diffusers.pipelines.flux import (
 
 from weights import WeightsDownloadCache
 
-import aiohttp
-import aiofiles
-import cv2
-
-MODEL_URL_DEV = (
-    "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
-)
-MODEL_URL_SCHNELL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/slim.tar"
-FLUX_DEV_PATH = Path("FLUX.1-dev")
-FLUX_SCHNELL_PATH = Path("FLUX.1-schnell")
 FEATURE_EXTRACTOR = Path("/src/feature-extractor")
 
 ASPECT_RATIOS = {
@@ -70,89 +64,68 @@ class Predictor(BasePredictor):
         print("Setup initiated")
         print("Setup took:", time.time() - start)
 
-    async def async_load_model(self, session, url: str, path: Path, model_name: str) -> FluxPipeline:
-        """Asynchronously download and load a single model."""
-        if not path.exists():
-            await self.download_base_weights(session, url, path)
+    def load_model(self, model_name: str) -> FluxPipeline:
+        """Synchronous download and load a single model."""
+        # if not path.exists():
+        #     self.download_base_weights(url, path)
+        print(model_name + "hugging gace")
+        full_model_name = "black-forest-labs/"+model_name
+        print(full_model_name)
         pipe = FluxPipeline.from_pretrained(
-            model_name,
+            full_model_name,
             torch_dtype=torch.bfloat16,
         ).to("cuda")
         return pipe
 
-    async def download_and_load_pipes(self, model_key: str, url: str, path: Path, model_name: str):
+    def download_and_load_pipes(self, model_key: str,  model_name: str):
         """Download and load pipelines for a specific model."""
-        async with aiohttp.ClientSession() as session:
-            pipe = await self.async_load_model(session, url, path, model_name)
-            self.pipes[model_key] = pipe
+        pipe = self.load_model( model_name)
+        self.pipes[model_key] = pipe
 
-            # Load img2img pipeline
-            img2img_pipe = FluxImg2ImgPipeline(
-                transformer=pipe.transformer,
-                scheduler=pipe.scheduler,
-                vae=pipe.vae,
-                text_encoder=pipe.text_encoder,
-                text_encoder_2=pipe.text_encoder_2,
-                tokenizer=pipe.tokenizer,
-                tokenizer_2=pipe.tokenizer_2,
-            ).to("cuda")
-            self.img2img_pipes[model_key] = img2img_pipe
+        # Load img2img pipeline
+        img2img_pipe = FluxImg2ImgPipeline(
+            transformer=pipe.transformer,
+            scheduler=pipe.scheduler,
+            vae=pipe.vae,
+            text_encoder=pipe.text_encoder,
+            text_encoder_2=pipe.text_encoder_2,
+            tokenizer=pipe.tokenizer,
+            tokenizer_2=pipe.tokenizer_2,
+        ).to("cuda")
+        self.img2img_pipes[model_key] = img2img_pipe
 
-            # Load inpaint pipeline
-            inpaint_pipe = FluxInpaintPipeline(
-                transformer=pipe.transformer,
-                scheduler=pipe.scheduler,
-                vae=pipe.vae,
-                text_encoder=pipe.text_encoder,
-                text_encoder_2=pipe.text_encoder_2,
-                tokenizer=pipe.tokenizer,
-                tokenizer_2=pipe.tokenizer_2,
-            ).to("cuda")
-            self.inpaint_pipes[model_key] = inpaint_pipe
+        # Load inpaint pipeline
+        inpaint_pipe = FluxInpaintPipeline(
+            transformer=pipe.transformer,
+            scheduler=pipe.scheduler,
+            vae=pipe.vae,
+            text_encoder=pipe.text_encoder,
+            text_encoder_2=pipe.text_encoder_2,
+            tokenizer=pipe.tokenizer,
+            tokenizer_2=pipe.tokenizer_2,
+        ).to("cuda")
+        self.inpaint_pipes[model_key] = inpaint_pipe
 
-            print(f"Loaded {model_key} pipelines")
+        print(f"Loaded {model_key} pipelines")
 
-    async def download_base_weights(self, session, url: str, dest: Path):
-        """Asynchronously download model weights using aiohttp."""
-        start = time.time()
-        print("Downloading URL:", url)
-        print("Downloading to:", dest)
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            # Ensure the destination directory exists
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            f = await aiofiles.open(dest, mode='wb')
-            async for chunk in resp.content.iter_chunked(1024):
-                await f.write(chunk)
-            await f.close()
-        print("Download completed in:", time.time() - start)
 
-    async def async_setup_pipes(self):
-        """Asynchronously prepare any necessary resources for lazy loading."""
-        # No models are loaded during setup; models are loaded on demand
-        pass
-
-    def setup_async(self):
-        """Synchronous wrapper for asynchronous setup."""
-        asyncio.run(self.async_setup_pipes())
-
-    async def ensure_model_loaded(self, model: str):
+    def ensure_model_loaded(self, model: str):
         """Ensure that the requested model is loaded, loading it if necessary."""
         if model in self.pipes:
             print(f"Model '{model}' is already loaded.")
             return
 
         models_info = {
-            "dev": (MODEL_URL_DEV, FLUX_DEV_PATH, "FLUX.1-dev"),
-            "schnell": (MODEL_URL_SCHNELL, FLUX_SCHNELL_PATH, "FLUX.1-schnell"),
+            "dev": ("FLUX.1-dev"),
+            "schnell": ( "FLUX.1-schnell"),
         }
 
         if model not in models_info:
             raise ValueError(f"Unknown model: {model}")
 
-        url, path, model_name = models_info[model]
+        model_name = models_info[model]
         print(f"Loading model '{model}'...")
-        await self.download_and_load_pipes(model, url, path, model_name)
+        self.download_and_load_pipes(model, model_name)
 
     @torch.inference_mode()
     def predict(  # pyright: ignore
@@ -251,7 +224,7 @@ class Predictor(BasePredictor):
     ) -> List[Path]:
         """Run a single prediction on the model"""
         # Ensure the required model is loaded
-        asyncio.run(self.ensure_model_loaded(model))
+        self.ensure_model_loaded(model)
 
         if seed is None or seed < 0:
             seed = int.from_bytes(os.urandom(2), "big")
@@ -432,7 +405,6 @@ class Predictor(BasePredictor):
             main=main_lora_url, extra=extra_lora_url
         )
 
-    @lru_cache(maxsize=None)  # Cached to avoid repeated calculations
     def aspect_ratio_to_width_height(self, aspect_ratio: str) -> tuple[int, int]:
         return ASPECT_RATIOS[aspect_ratio]
 
@@ -468,8 +440,8 @@ if __name__ == "__main__":
         parser.add_argument("--replicate_weights", type=str, default=None, help="Replicate LoRA weights URL.")
         return parser.parse_args()
 
-    async def run_prediction(predictor, args):
-        """Asynchronously run the prediction."""
+    def run_prediction(predictor, args):
+        """Run the prediction synchronously."""
         # Convert SysPath to cog.Path if necessary
         image_path = Path(args.image) if args.image else None
         mask_path = Path(args.mask) if args.mask else None
@@ -503,9 +475,9 @@ if __name__ == "__main__":
         args = parse_args()
         predictor = Predictor()
         print("Running setup...")
-        predictor.setup_async()
+        predictor.setup()
 
         print("Running prediction...")
-        asyncio.run(run_prediction(predictor, args))
+        run_prediction(predictor, args)
 
     main()
